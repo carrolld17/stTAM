@@ -1,0 +1,31 @@
+# Inference preset; not a full benchmark reproduction configuration.
+model_cfg: edgetam.yaml
+seed: 2026
+classification_frame: 50
+tracker:
+  max_tracks: 12
+  max_lost_frames: 125
+  flow_recovery_frames: 0
+  min_area_ratio: 0.0015
+  min_thin_area_ratio: 0.0002
+  thin_elongation: 2.2
+  max_area_ratio: 0.2
+  fallback_motion_threshold: 0.75
+  refine_tool_tip_box: true
+  box_association_iou: 0.05
+protocol: endovis2017
+box_source: mask
+frames_fps: 5
+mask_generator:
+  points_per_side: 32
+  pred_iou_thresh: 0.8
+  stability_score_thresh: 0.85
+  min_mask_region_area: 200
+endovis:
+  candidate_min_area: 800
+  candidate_max_area: 100000
+  initial_positive_points: 22
+  history_length: 20
+  tracking_points: 10
+  min_valid_points: 5
+  track_mask_threshold: -2.0
