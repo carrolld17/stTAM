@@ -1,22 +1,8 @@
-# Inference preset; not a full benchmark reproduction configuration.
-# Settings from the existing VID39 demo script.
-# Shared cache: task-trained YOLO11n, confidence 0.1, image size 512.
-# This program consumes the cache; it does not run or train YOLO.
 model_cfg: edgetam.yaml
 seed: 2026
 classification_frame: 50
 tracker:
-  max_tracks: 12
-  max_lost_frames: 125
-  flow_recovery_frames: 0
-  min_area_ratio: 0.0015
-  min_thin_area_ratio: 0.0002
-  thin_elongation: 2.2
-  max_area_ratio: 0.2
-  fallback_motion_threshold: 0.75
-  refine_tool_tip_box: true
   box_association_iou: 0.05
-protocol: cholectrack20
 box_source: yolo11
 mask_generator:
   points_per_side: 32
@@ -24,23 +10,11 @@ mask_generator:
   stability_score_thresh: 0.84
   min_mask_region_area: 50
   crop_n_layers: 0
-discovery:
-  min_area_ratio: 0.002
-  min_thin_area_ratio: 0.001
-  duplicate_containment: 0.8
-motion:
-  primary_max_brightness: 150.0
-  primary_max_elongation: 1.5
-  secondary_threshold_ratio: 0.45
-  secondary_min_elongation: 1.5
-  secondary_min_brightness: 30.0
-  secondary_min_area_ratio: 0.005
-  secondary_max_area_ratio: 0.055
-boxes:
-  force_tip_min_elongation: 1.5
-  force_tip_min_center_y_ratio: 0.25
-  endpoint_quantile: 0.4
-  prefer_distal_each_frame: true
-  full_min_short_side_ratio: 0.65
-propagation:
-  exclusive_logits: true
+anchors:
+  candidate_min_area_ratio: 0.002
+  candidate_max_area_ratio: 0.2
+  initial_positive_points: 22
+  history_length: 20
+  tracking_points: 10
+  min_valid_points: 5
+  track_mask_threshold: 0.0

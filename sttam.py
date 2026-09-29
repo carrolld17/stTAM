@@ -1,24 +1,16 @@
-
-"""stTAM automatic discovery, motion classification and mask-guided tracking.
-
-The demo uses the standard frozen EdgeTAM backbone. It does not enable local
-experimental CAM/ORM extensions or contain benchmark evaluation machinery.
-"""
-
 from __future__ import annotations
 import argparse
 import json
 import math
 import os
 import re
-import statistics
 import tempfile
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-# Keep --help available before installing model dependencies.
+
 if __name__ == "__main__" and any(x in __import__("sys").argv for x in ("-h", "--help")):
     print(
         "python sttam.py --config configs/endovis2017.yaml --input VIDEO_OR_FRAME_DIR --checkpoint EDGETAM_PT [--output DIR] [--device auto|cpu|cuda] [--max-frames N] [--box-source mask|yolo11] [--detection-cache JSON] [--show]"
@@ -34,16 +26,11 @@ from sklearn.cluster import KMeans
 from skimage.morphology import dilation, disk
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 from sam2.build_sam import build_sam2_video_predictor
+from sam2.modeling.perceiver import PerceiverResampler, window_partition
 from sam2.sam2_video_predictor import SAM2VideoPredictor
 from sam2.utils.misc import load_video_frames
 
 Box = Tuple[int, int, int, int]
-DISCOVERY_FILTER_SETTINGS_BY_VIDEO = {}
-MOTION_CLASSIFICATION_SETTINGS_BY_VIDEO = {}
-BENCHMARK_BOX_SETTINGS_BY_VIDEO = {}
-MASK_PROPAGATION_SETTINGS_BY_VIDEO = {}
-MAX_LOST_FRAMES_BY_VIDEO = {}
-INITIAL_POINT_PROMPTS_BY_VIDEO = {}
 USE_MASK_GATE = True
 USE_RESAMPLING = True
 HISTORY_LENGTH = 20
@@ -52,8 +39,22 @@ TRACKING_POINTS = 10
 RANDOM_SEED = 0
 
 
+class BatchedPerceiverResampler(PerceiverResampler):
+    def forward_2d(self, x):
+        batch, channels, height, width = x.shape
+        latents = self.latents_2d.unsqueeze(0).expand(batch, -1, -1).reshape(-1, 1, channels)
+        windows = int(math.sqrt(self.num_latents_2d))
+        x = window_partition(x.permute(0, 2, 3, 1), height // windows).flatten(1, 2)
+        for layer in self.layers:
+            latents = layer(latents, x)
+        latents = latents.reshape(batch, windows, windows, channels).permute(0, 3, 1, 2)
+        position = self.position_encoding(latents).permute(0, 2, 3, 1).flatten(1, 2)
+        latents = self.norm(latents.permute(0, 2, 3, 1).flatten(1, 2))
+        return latents, position
+
+
 class StreamingPredictor(SAM2VideoPredictor):
-    """Frame-at-a-time adapter; no local sam2 modifications are required."""
+
 
     @torch.inference_mode()
     def init_state(
@@ -65,7 +66,7 @@ class StreamingPredictor(SAM2VideoPredictor):
         offload_state_to_cpu=False,
         async_loading_frames=False,
     ):
-        """Initialize an inference state for both pre-recorded and realtime video."""
+
         compute_device = self.device
         if is_realtime:
             images = None
@@ -116,12 +117,6 @@ class StreamingPredictor(SAM2VideoPredictor):
             },
             "tracking_has_started": False,
             "frames_already_tracked": {},
-            "ma_sam2": {
-                "cam_scores": None,
-                "object_sizes": {},
-                "orm_frames": [],
-                "last_orm_frame": -1,
-            },
         }
         if is_realtime:
             inference_state["video_dir"] = video_path
@@ -130,7 +125,7 @@ class StreamingPredictor(SAM2VideoPredictor):
         return inference_state
 
     def _get_image_feature(self, inference_state, frame_idx, batch_size):
-        """Compute the image features on a given frame."""
+
         is_realtime = inference_state.get("is_realtime", False)
         image, backbone_out = inference_state["cached_features"].get(frame_idx, (None, None))
         if backbone_out is None:
@@ -148,6 +143,9 @@ class StreamingPredictor(SAM2VideoPredictor):
                         image_np, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR
                     )
                 image = torch.from_numpy(image_np).permute(2, 0, 1).to(device).float() / 255.0
+                mean = image.new_tensor([0.485, 0.456, 0.406])[:, None, None]
+                std = image.new_tensor([0.229, 0.224, 0.225])[:, None, None]
+                image = (image - mean) / std
                 image = image.unsqueeze(0)
             else:
                 image = inference_state["images"][frame_idx].to(device).float().unsqueeze(0)
@@ -171,7 +169,7 @@ class StreamingPredictor(SAM2VideoPredictor):
 def sample_prompt_points(
     mask: np.ndarray, positive_count: int, negative_count: int, boundary_radius: int = 6
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    
+
     mask_bool = mask.astype(bool)
     y_coordinates, x_coordinates = np.where(mask_bool)
     if len(x_coordinates) < positive_count:
@@ -214,7 +212,7 @@ def update_anchor_points(
     current_tracking_mask: Optional[np.ndarray],
     lk_parameters: Dict[str, Any],
 ) -> Tuple[Optional[np.ndarray], List[List[List[float]]], bool]:
-    
+
     valid_new_points: List[np.ndarray] = []
     kept_old_indices: List[int] = []
     if previous_points is not None and len(previous_points) > 0:
@@ -277,45 +275,42 @@ def update_anchor_points(
 def extract_motion_features(
     all_histories: List[List[List[List[float]]]],
 ) -> Tuple[np.ndarray, List[int], Dict[int, Dict[str, float]]]:
-    
-    feature_list: List[List[float]] = []
-    valid_object_indices: List[int] = []
-    feature_details: Dict[int, Dict[str, float]] = {}
+    feature_list = []
+    valid_object_indices = []
+    feature_details = {}
     for object_index, object_histories in enumerate(all_histories):
-        object_point_variances: List[float] = []
-        object_point_speeds: List[float] = []
+        variances = []
+        speeds = []
         for trajectory in object_histories:
-            if len(trajectory) < 5:
+            points = np.asarray(trajectory, dtype=np.float64)
+            if len(points) < 5 or not np.isfinite(points).all():
                 continue
-            trajectory_array = np.asarray(trajectory, dtype=np.float32)
-            slopes: List[float] = []
-            for time_index in range(1, len(trajectory_array)):
-                dx = float(trajectory_array[time_index, 0] - trajectory_array[time_index - 1, 0])
-                dy = float(trajectory_array[time_index, 1] - trajectory_array[time_index - 1, 1])
-                slopes.append(dy / dx if abs(dx) > 1.0 else 0.0)
-            slope_variance = float(statistics.variance(slopes)) if len(slopes) > 5 else 0.0
-            average_speed = float(
-                np.mean(np.linalg.norm(np.diff(trajectory_array, axis=0), axis=1))
-            )
-            object_point_variances.append(slope_variance)
-            object_point_speeds.append(average_speed)
-        if object_point_variances:
-            median_variance = float(np.median(object_point_variances))
-            median_speed = float(np.median(object_point_speeds))
-            feature_list.append([median_variance, median_speed])
+            displacement = np.diff(points, axis=0)
+            lengths = np.linalg.norm(displacement, axis=1)
+            speeds.append(float(lengths.mean()))
+            nonzero = displacement[lengths > 0.0]
+            if len(nonzero) > 5:
+                angles = np.arctan2(nonzero[:, 1], nonzero[:, 0])
+                resultant = np.hypot(np.cos(angles).mean(), np.sin(angles).mean())
+                variances.append(float(np.clip(1.0 - resultant, 0.0, 1.0)))
+        if variances and speeds:
+            variance = float(np.median(variances))
+            speed = float(np.median(speeds))
+            feature_list.append([variance, speed])
             valid_object_indices.append(object_index)
             feature_details[object_index] = {
-                "median_slope_variance": median_variance,
-                "median_speed": median_speed,
-                "valid_trajectories": len(object_point_variances),
+                "median_circular_variance": variance,
+                "median_speed": speed,
+                "direction_valid_trajectories": len(variances),
+                "displacement_valid_trajectories": len(speeds),
             }
-    return (np.asarray(feature_list, dtype=np.float64), valid_object_indices, feature_details)
+    return np.asarray(feature_list, dtype=np.float64).reshape(-1, 2), valid_object_indices, feature_details
 
 
 def classify_instrument_candidates(
     all_histories: List[List[List[List[float]]]], number_of_objects: int
 ) -> Tuple[List[int], Dict[str, Any]]:
-    
+
     final_labels = [1] * number_of_objects
     feature_array, valid_object_indices, feature_details = extract_motion_features(all_histories)
     classification_log: Dict[str, Any] = {
@@ -335,6 +330,15 @@ def classify_instrument_candidates(
         final_labels[valid_object_indices[0]] = 0
         classification_log["fallback"] = "single_valid_candidate"
         return (final_labels, classification_log)
+    feature_array = (feature_array - feature_array.min(axis=0)) / (
+        np.ptp(feature_array, axis=0) + 1e-8
+    )
+    classification_log["normalized_features"] = feature_array.tolist()
+    if np.unique(feature_array, axis=0).shape[0] < 2:
+        for index in valid_object_indices:
+            final_labels[index] = 0
+        classification_log["fallback"] = "identical_features_keep_valid"
+        return final_labels, classification_log
     kmeans = KMeans(n_clusters=2, n_init=20, random_state=RANDOM_SEED).fit(feature_array)
     cluster_scores: List[float] = []
     for cluster_id in range(2):
@@ -366,19 +370,11 @@ class Track:
     last_mask: np.ndarray
     status: str = "pending"
     last_box: Optional[Box] = None
-    output_box: Optional[Box] = None
-    box_mode: str = "full"
+    output_box: Optional[Tuple[float, float, float, float]] = None
     last_score: float = 0.0
     lost_frames: int = 0
-    age: int = 0
     active_points: Optional[np.ndarray] = None
-    trajectories: List[deque] = field(default_factory=list)
-    motion_samples: deque = field(default_factory=lambda: deque(maxlen=150))
-    initial_elongation: float = 1.0
-    initial_brightness: float = 0.0
-    initial_area_ratio: float = 0.0
-    initial_box: Optional[Box] = None
-    tip_extent_ratio: Optional[float] = None
+    trajectories: List[List[List[float]]] = field(default_factory=list)
 
 
 def mask_to_box(mask: np.ndarray, min_pixels: int = 20) -> Optional[Box]:
@@ -388,377 +384,11 @@ def mask_to_box(mask: np.ndarray, min_pixels: int = 20) -> Optional[Box]:
     return (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
 
 
-def box_iou(a: Box, b: Box) -> float:
-    ix1, iy1 = (max(a[0], b[0]), max(a[1], b[1]))
-    ix2, iy2 = (min(a[2], b[2]), min(a[3], b[3]))
-    intersection = max(0, ix2 - ix1 + 1) * max(0, iy2 - iy1 + 1)
-    area_a = max(0, a[2] - a[0] + 1) * max(0, a[3] - a[1] + 1)
-    area_b = max(0, b[2] - b[0] + 1) * max(0, b[3] - b[1] + 1)
-    union = area_a + area_b - intersection
-    return float(intersection / union) if union else 0.0
-
-
-def box_containment(a: Box, b: Box) -> float:
-    """Intersection area divided by the smaller box area."""
-    ix1, iy1 = (max(a[0], b[0]), max(a[1], b[1]))
-    ix2, iy2 = (min(a[2], b[2]), min(a[3], b[3]))
-    intersection = max(0, ix2 - ix1 + 1) * max(0, iy2 - iy1 + 1)
-    area_a = max(1, (a[2] - a[0] + 1) * (a[3] - a[1] + 1))
-    area_b = max(1, (b[2] - b[0] + 1) * (b[3] - b[1] + 1))
-    return float(intersection / min(area_a, area_b))
-
-
-def box_gap(a: Box, b: Box) -> float:
-    """Euclidean separation between boxes; zero when they touch or overlap."""
-    horizontal = max(a[0] - b[2] - 1, b[0] - a[2] - 1, 0)
-    vertical = max(a[1] - b[3] - 1, b[1] - a[3] - 1, 0)
-    return float(math.hypot(horizontal, vertical))
-
-
-def union_box(a: Box, b: Box) -> Box:
-    return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
-
-
-def preserve_full_box_short_side(
-    box: Box, initial_box: Optional[Box], minimum_ratio: float, image_shape: Tuple[int, int]
-) -> Box:
-    """Prevent a full-mask box collapsing to one thin propagated fragment."""
-    if initial_box is None or minimum_ratio <= 0.0:
-        return box
-    image_height, image_width = image_shape
-    initial_width = initial_box[2] - initial_box[0] + 1
-    initial_height = initial_box[3] - initial_box[1] + 1
-    width = box[2] - box[0] + 1
-    height = box[3] - box[1] + 1
-    minimum_short_side = minimum_ratio * min(initial_width, initial_height)
-    x1, y1, x2, y2 = box
-    if width <= height and width < minimum_short_side:
-        center = (x1 + x2) / 2.0
-        half = (minimum_short_side - 1.0) / 2.0
-        x1, x2 = (int(np.floor(center - half)), int(np.ceil(center + half)))
-    elif height < width and height < minimum_short_side:
-        center = (y1 + y2) / 2.0
-        half = (minimum_short_side - 1.0) / 2.0
-        y1, y2 = (int(np.floor(center - half)), int(np.ceil(center + half)))
-    return (max(0, x1), max(0, y1), min(image_width - 1, x2), min(image_height - 1, y2))
-
-
-def box_elongation(box: Box) -> float:
-    width = box[2] - box[0] + 1
-    height = box[3] - box[1] + 1
-    return max(width, height) / max(1, min(width, height))
-
-
-def mask_overlap(a: np.ndarray, b: np.ndarray) -> Tuple[float, float]:
-    intersection = int(np.logical_and(a, b).sum())
-    if intersection == 0:
-        return (0.0, 0.0)
-    union = int(np.logical_or(a, b).sum())
-    smaller = min(int(a.sum()), int(b.sum()))
-    return (intersection / max(1, union), intersection / max(1, smaller))
-
-
-def largest_component(mask: np.ndarray) -> np.ndarray:
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
-    if count <= 1:
-        return mask.astype(bool)
-    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    return labels == largest
-
-
 def confidence_from_logits(logits: np.ndarray, mask: np.ndarray) -> float:
     if not np.any(mask):
         return 0.0
     probability = 1.0 / (1.0 + np.exp(-np.clip(logits[mask], -30.0, 30.0)))
     return float(probability.mean())
-
-
-def initial_box_mode(mask: np.ndarray, base_box: Box, enabled: bool) -> str:
-    """Choose the benchmark-box convention once from the initial predicted mask."""
-    if not enabled or int(mask.sum()) < 100:
-        return "full"
-    image_height, image_width = mask.shape
-    box_width = base_box[2] - base_box[0] + 1
-    box_height = base_box[3] - base_box[1] + 1
-    elongation = max(box_width, box_height) / max(1, min(box_width, box_height))
-    base_area = box_width * box_height
-    return (
-        "tip"
-        if 1.3 <= elongation <= 3.0 and base_area >= 0.04 * image_height * image_width
-        else "full"
-    )
-
-
-def benchmark_box_from_mask(
-    mask: np.ndarray,
-    base_box: Box,
-    box_mode: str,
-    previous_box: Optional[Box] = None,
-    endpoint_quantile: float = 0.1,
-    prefer_distal_each_frame: bool = False,
-    frame_bgr: Optional[np.ndarray] = None,
-    appearance_settings: Optional[Dict[str, float]] = None,
-    previous_extent_ratio: Optional[float] = None,
-) -> Tuple[Box, Optional[float]]:
-    """Derive a benchmark box while retaining the full mask for propagation."""
-    if box_mode != "tip" or int(mask.sum()) < 100:
-        return (base_box, None)
-    image_height, image_width = mask.shape
-    box_width = base_box[2] - base_box[0] + 1
-    box_height = base_box[3] - base_box[1] + 1
-    base_area = box_width * box_height
-    ys, xs = np.where(mask)
-    coordinates = np.column_stack((xs, ys)).astype(np.float32)
-    centered = coordinates - coordinates.mean(axis=0, keepdims=True)
-    _, _, axes = np.linalg.svd(centered, full_matrices=False)
-    principal_axis = axes[0]
-    projection = centered @ principal_axis
-    low_point = coordinates[int(np.argmin(projection))]
-    high_point = coordinates[int(np.argmax(projection))]
-
-    def border_distance(point: np.ndarray) -> float:
-        x, y = (float(point[0]), float(point[1]))
-        return min(x, y, image_width - 1 - x, image_height - 1 - y)
-
-    def endpoint_box(selector: np.ndarray) -> Optional[Box]:
-        if int(selector.sum()) < 20:
-            return None
-        endpoint_coordinates = coordinates[selector]
-        x1, y1 = np.floor(endpoint_coordinates.min(axis=0)).astype(int)
-        x2, y2 = np.ceil(endpoint_coordinates.max(axis=0)).astype(int)
-        pad = 5
-        refined = (
-            max(0, x1 - pad),
-            max(0, y1 - pad),
-            min(image_width - 1, x2 + pad),
-            min(image_height - 1, y2 + pad),
-        )
-        refined_area = (refined[2] - refined[0] + 1) * (refined[3] - refined[1] + 1)
-        return refined if refined_area >= 100 and refined_area <= 1.25 * base_area else None
-
-    def appearance_extent(oriented_projection: np.ndarray) -> Optional[float]:
-        """Find the working-end/shaft transition from color inside the mask."""
-        settings = appearance_settings or {}
-        if not settings.get("appearance_adaptive") or frame_bgr is None:
-            return None
-        span = float(np.ptp(oriented_projection))
-        if span < 8.0:
-            return None
-        normalized = (oriented_projection - float(oriented_projection.min())) / span
-        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        values = hsv[..., 2][mask]
-        saturations = hsv[..., 1][mask]
-        bright = (values >= float(settings.get("appearance_min_value", 140))) & (
-            saturations <= float(settings.get("appearance_max_saturation", 115))
-        )
-        bin_count = 30
-        bin_ids = np.minimum((normalized * bin_count).astype(np.int32), bin_count - 1)
-        totals = np.bincount(bin_ids, minlength=bin_count)
-        bright_totals = np.bincount(bin_ids[bright], minlength=bin_count)
-        fractions = np.divide(
-            bright_totals, totals, out=np.zeros(bin_count, dtype=np.float64), where=totals > 0
-        )
-        active = (
-            (totals >= 8)
-            & (bright_totals >= 4)
-            & (fractions >= float(settings.get("appearance_min_bin_fraction", 0.3)))
-        ).astype(np.uint8)
-        active = cv2.morphologyEx(
-            active.reshape(1, -1), cv2.MORPH_CLOSE, np.ones((1, 3), np.uint8)
-        )[0]
-        runs: List[Tuple[int, int]] = []
-        start: Optional[int] = None
-        for index, enabled in enumerate(np.r_[active, 0]):
-            if enabled and start is None:
-                start = index
-            elif not enabled and start is not None:
-                if index - start >= 2:
-                    runs.append((start, index - 1))
-                start = None
-        if not runs:
-            return None
-        start_bin, end_bin = max(
-            runs,
-            key=lambda run: (sum(bright_totals[run[0] : run[1] + 1]), run[1] - run[0], -run[0]),
-        )
-        if start_bin > int(0.55 * bin_count):
-            return None
-        padding = float(settings.get("appearance_extent_padding", 0.05))
-        extent = float(np.clip((end_bin + 1) / bin_count + padding, 0.12, 1.0))
-        if previous_extent_ratio is not None:
-            current_weight = float(settings.get("appearance_extent_smoothing", 0.65))
-            current_weight = float(np.clip(current_weight, 0.0, 1.0))
-            extent = current_weight * extent + (1.0 - current_weight) * previous_extent_ratio
-        return extent
-
-    endpoint_quantile = float(np.clip(endpoint_quantile, 0.05, 0.45))
-    low_quantile, high_quantile = np.quantile(
-        projection, (endpoint_quantile, 1.0 - endpoint_quantile)
-    )
-    endpoint_boxes = [
-        endpoint_box(projection <= low_quantile),
-        endpoint_box(projection >= high_quantile),
-    ]
-    if (
-        previous_box is not None
-        and (not prefer_distal_each_frame)
-        and all((box is not None for box in endpoint_boxes))
-    ):
-        previous_center = np.asarray(
-            [(previous_box[0] + previous_box[2]) / 2, (previous_box[1] + previous_box[3]) / 2]
-        )
-        centers = [
-            np.asarray([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2]) for box in endpoint_boxes
-        ]
-        selected = endpoint_boxes[
-            int(np.argmin([np.linalg.norm(c - previous_center) for c in centers]))
-        ]
-        return (selected or base_box, previous_extent_ratio)
-    preferred = 0 if border_distance(low_point) > border_distance(high_point) else 1
-    oriented_projection = projection if preferred == 0 else -projection
-    extent_ratio = appearance_extent(oriented_projection)
-    if extent_ratio is not None:
-        minimum = float(oriented_projection.min())
-        maximum = float(oriented_projection.max())
-        adaptive_selector = oriented_projection <= minimum + extent_ratio * (maximum - minimum)
-        adaptive_box = endpoint_box(adaptive_selector)
-        if adaptive_box is not None:
-            return (adaptive_box, extent_ratio)
-    return (
-        endpoint_boxes[preferred] or endpoint_boxes[1 - preferred] or base_box,
-        previous_extent_ratio,
-    )
-
-
-def sample_points(mask: np.ndarray, count: int, rng: np.random.Generator) -> Optional[np.ndarray]:
-    ys, xs = np.where(mask)
-    if len(xs) < count:
-        return None
-    chosen = rng.choice(len(xs), size=count, replace=False)
-    return np.column_stack((xs[chosen], ys[chosen])).astype(np.float32).reshape(-1, 1, 2)
-
-
-def camera_motion(prev_gray: np.ndarray, gray: np.ndarray) -> np.ndarray:
-    corners = cv2.goodFeaturesToTrack(
-        prev_gray, maxCorners=160, qualityLevel=0.01, minDistance=12, blockSize=7
-    )
-    if corners is None or len(corners) < 8:
-        return np.zeros(2, dtype=np.float32)
-    moved, status, _ = cv2.calcOpticalFlowPyrLK(
-        prev_gray,
-        gray,
-        corners,
-        None,
-        winSize=(31, 31),
-        maxLevel=3,
-        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03),
-    )
-    if moved is None or status is None:
-        return np.zeros(2, dtype=np.float32)
-    good = status.ravel() == 1
-    if good.sum() < 8:
-        return np.zeros(2, dtype=np.float32)
-    return np.median(moved[good, 0] - corners[good, 0], axis=0).astype(np.float32)
-
-
-def update_motion(
-    track: Track,
-    prev_gray: np.ndarray,
-    gray: np.ndarray,
-    mask: np.ndarray,
-    global_shift: np.ndarray,
-    rng: np.random.Generator,
-) -> None:
-    old_points = track.active_points
-    new_points: List[np.ndarray] = []
-    new_trajectories: List[deque] = []
-    residual_speeds: List[float] = []
-    if old_points is not None and len(old_points):
-        moved, status, _ = cv2.calcOpticalFlowPyrLK(
-            prev_gray,
-            gray,
-            old_points,
-            None,
-            winSize=(31, 31),
-            maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03),
-        )
-        if moved is not None and status is not None:
-            for index, (point, valid) in enumerate(zip(moved[:, 0], status.ravel())):
-                x, y = (int(round(point[0])), int(round(point[1])))
-                if valid and 0 <= y < mask.shape[0] and (0 <= x < mask.shape[1]) and mask[y, x]:
-                    residual = point - old_points[index, 0] - global_shift
-                    residual_speeds.append(float(np.linalg.norm(residual)))
-                    history = (
-                        track.trajectories[index]
-                        if index < len(track.trajectories)
-                        else deque(maxlen=20)
-                    )
-                    history.append(point.copy())
-                    new_points.append(point)
-                    new_trajectories.append(history)
-    if residual_speeds:
-        track.motion_samples.append(float(np.median(residual_speeds)))
-    if len(new_points) < 8:
-        sampled = sample_points(mask, 16, rng)
-        if sampled is not None:
-            track.active_points = sampled
-            track.trajectories = [deque([point[0].copy()], maxlen=20) for point in sampled]
-            return
-    track.active_points = (
-        np.asarray(new_points, dtype=np.float32).reshape(-1, 1, 2) if new_points else None
-    )
-    track.trajectories = new_trajectories
-
-
-def motion_score(track: Track) -> Optional[float]:
-    if len(track.motion_samples) < 8:
-        return None
-    values = np.asarray(track.motion_samples, dtype=np.float32)
-    return float(np.median(values) + 0.25 * np.percentile(values, 90) + 0.1 * values.std())
-
-
-def flow_recovery_mask(
-    track: Track, prev_gray: Optional[np.ndarray], gray: np.ndarray, global_shift: np.ndarray
-) -> Optional[np.ndarray]:
-    """Recover a briefly lost confirmed mask using its own optical-flow points."""
-    if prev_gray is None:
-        return None
-    recovery_points = track.active_points
-    if recovery_points is None or len(recovery_points) < 4:
-        recovery_points = sample_points(track.last_mask, 16, np.random.default_rng(2026))
-    if recovery_points is None or len(recovery_points) < 4:
-        return None
-    moved, status, _ = cv2.calcOpticalFlowPyrLK(
-        prev_gray,
-        gray,
-        recovery_points,
-        None,
-        winSize=(31, 31),
-        maxLevel=3,
-        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03),
-    )
-    if moved is None or status is None:
-        return None
-    valid = status.ravel() == 1
-    if int(valid.sum()) < 4:
-        return None
-    displacement = np.median(moved[valid, 0] - recovery_points[valid, 0], axis=0).astype(np.float32)
-    if float(np.linalg.norm(displacement)) > 80.0:
-        return None
-    height, width = gray.shape
-    matrix = np.asarray(
-        [[1.0, 0.0, float(displacement[0])], [0.0, 1.0, float(displacement[1])]], dtype=np.float32
-    )
-    recovered = cv2.warpAffine(
-        track.last_mask.astype(np.uint8),
-        matrix,
-        (width, height),
-        flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT,
-    ).astype(bool)
-    recovered = largest_component(recovered)
-    return recovered if mask_to_box(recovered, min_pixels=20) is not None else None
 
 
 class STTAMRunner:
@@ -767,453 +397,53 @@ class STTAMRunner:
         self.args = args
         self.predictor = predictor
         self.mask_generator = mask_generator
-        self.rng = np.random.default_rng(args.seed)
         self.tracks: Dict[int, Track] = {}
         self.next_id = 1
         self.state = None
         self.initial_classification_done = False
-        self.motion_threshold: Optional[float] = None
         self.temp_dir: Optional[Path] = None
         self.yolo_detections: Optional[List[np.ndarray]] = None
-        self.current_video_name: Optional[str] = None
+        self.initial_prompts = {}
 
-    def discover(self, frame_bgr: np.ndarray, video_name: str) -> List[np.ndarray]:
-        height, width = frame_bgr.shape[:2]
-        image_area = height * width
-        filter_settings = DISCOVERY_FILTER_SETTINGS_BY_VIDEO.get(video_name, {})
-        min_area_ratio = max(
-            self.args.min_area_ratio,
-            float(filter_settings.get("min_area_ratio", self.args.min_area_ratio)),
-        )
-        min_thin_area_ratio = max(
-            self.args.min_thin_area_ratio,
-            float(filter_settings.get("min_thin_area_ratio", self.args.min_thin_area_ratio)),
-        )
-        reject_bottom_margin = int(filter_settings.get("reject_bottom_margin", 0))
-        duplicate_containment = float(filter_settings.get("duplicate_containment", 0.88))
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        masks = self.mask_generator.generate(frame_rgb)
-        prompts = INITIAL_POINT_PROMPTS_BY_VIDEO.get(video_name, [])
-        if prompts:
-            self.mask_generator.predictor.set_image(frame_rgb)
-            for prompt in prompts:
-                guided_masks, scores, _ = self.mask_generator.predictor.predict(
-                    point_coords=np.asarray(prompt["points"], dtype=np.float32),
-                    point_labels=np.asarray(prompt["labels"], dtype=np.int32),
-                    box=np.asarray(prompt["box"], dtype=np.float32) if "box" in prompt else None,
-                    multimask_output=True,
-                )
-                best = int(np.argmax(scores))
-                masks.append(
-                    {
-                        "segmentation": guided_masks[best].astype(bool),
-                        "predicted_iou": float(scores[best]) + 1.0,
-                    }
-                )
-            self.mask_generator.predictor.reset_predictor()
-        eligible = []
-        for item in masks:
-            mask = largest_component(np.asarray(item["segmentation"], dtype=bool))
-            area_ratio = float(mask.sum() / image_area)
-            box = mask_to_box(mask)
-            if box is None or area_ratio > self.args.max_area_ratio:
-                continue
-            if reject_bottom_margin and box[3] >= height - reject_bottom_margin:
-                continue
-            box_width, box_height = (box[2] - box[0] + 1, box[3] - box[1] + 1)
-            elongation = max(box_width, box_height) / max(1, min(box_width, box_height))
-            is_thin = elongation >= self.args.thin_elongation
-            minimum_area = min_thin_area_ratio if is_thin else min_area_ratio
-            if area_ratio < minimum_area:
-                continue
-            if elongation < 1.15 and area_ratio > 0.03:
-                continue
-            touches_edge = (
-                box[0] <= 8 or box[1] <= 8 or box[2] >= width - 9 or (box[3] >= height - 9)
-            )
-            mean_brightness = float(gray[mask].mean()) if np.any(mask) else 0.0
-            if touches_edge and area_ratio > 0.02 and (mean_brightness < 40.0):
-                continue
-            priority = (
-                float(item["predicted_iou"])
-                + (0.1 if is_thin else 0.0)
-                + (0.08 if is_thin and touches_edge else 0.0)
-            )
-            eligible.append((priority, mask, box, area_ratio, elongation, mean_brightness))
-        selected = []
-        for _, mask, box, area_ratio, elongation, brightness in sorted(
-            eligible, reverse=True, key=lambda x: x[0]
-        ):
-            duplicate_index = None
-            for index, kept in enumerate(selected):
-                mask_iou, mask_contained = mask_overlap(mask, kept[0])
-                if (
-                    mask_iou >= 0.45
-                    or mask_contained >= 0.75
-                    or box_containment(box, kept[1]) >= duplicate_containment
-                ):
-                    duplicate_index = index
-                    break
-            if duplicate_index is not None:
-                if int(mask.sum()) > int(selected[duplicate_index][0].sum()):
-                    selected[duplicate_index] = (mask, box, area_ratio, elongation, brightness)
-                continue
-            selected.append((mask, box, area_ratio, elongation, brightness))
-            if len(self.tracks) + len(selected) >= self.args.max_tracks:
-                break
-        candidates = [item[0] for item in selected]
-        for index, (mask, box, area_ratio, elongation, brightness) in enumerate(selected, 1):
-            print(
-                f"  candidate {index}: box={box}, area={int(mask.sum())} ({100.0 * area_ratio:.3f}%), elongation={elongation:.2f}, brightness={brightness:.1f}"
-            )
-        return candidates
+    def discover(self, frame_bgr, video_name):
+        settings = self.args.anchors
+        image_area = frame_bgr.shape[0] * frame_bgr.shape[1]
+        minimum = settings.get("candidate_min_area", settings.get("candidate_min_area_ratio", 0.002) * image_area)
+        maximum = settings.get("candidate_max_area", settings.get("candidate_max_area_ratio", 0.2) * image_area)
+        return [
+            m["segmentation"].astype(bool)
+            for m in self.mask_generator.generate(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+            if minimum < m["area"] < maximum
+        ]
 
-    def add_candidates(
-        self, masks: Iterable[np.ndarray], frame_index: int, frame_bgr: np.ndarray
-    ) -> int:
-        added = 0
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        image_height = gray.shape[0]
+    def add_candidates(self, masks, frame_index, frame_bgr):
+        self.initial_prompts = {}
         for mask in masks:
-            box = mask_to_box(mask)
-            if box is None:
+            positive, negative = sample_prompt_points(
+                mask, self.args.anchors["initial_positive_points"], 5
+            )
+            if positive is None:
                 continue
-            box_width = box[2] - box[0] + 1
-            box_height = box[3] - box[1] + 1
-            box_mode = initial_box_mode(mask, box, self.args.refine_tool_tip_box)
-            box_settings = BENCHMARK_BOX_SETTINGS_BY_VIDEO.get(self.current_video_name or "", {})
-            force_tip_min_elongation = box_settings.get("force_tip_min_elongation")
-            if box_settings.get("force_full"):
-                box_mode = "full"
-            elif force_tip_min_elongation is not None:
-                initial_elongation = max(box_width, box_height) / max(1, min(box_width, box_height))
-                initial_brightness = float(gray[mask].mean()) if np.any(mask) else 0.0
-                brightness_limit = float(box_settings.get("force_tip_min_brightness", 0.0))
-                center_y_ratio = (box[1] + box[3]) / 2.0 / max(1, image_height)
-                center_y_limit = float(box_settings.get("force_tip_min_center_y_ratio", 0.0))
-                box_mode = (
-                    "tip"
-                    if initial_elongation >= float(force_tip_min_elongation)
-                    and initial_brightness >= brightness_limit
-                    and (center_y_ratio >= center_y_limit)
-                    else "full"
-                )
-            output_box, tip_extent_ratio = benchmark_box_from_mask(
-                mask,
-                box,
-                box_mode,
-                endpoint_quantile=float(box_settings.get("endpoint_quantile", 0.1)),
-                prefer_distal_each_frame=bool(box_settings.get("prefer_distal_each_frame", False)),
-                frame_bgr=frame_bgr,
-                appearance_settings=box_settings,
-            )
-            track = Track(
-                track_id=self.next_id,
-                birth_frame=frame_index,
-                last_mask=mask,
-                last_box=box,
-                output_box=output_box,
-                box_mode=box_mode,
-                active_points=sample_points(mask, 16, self.rng),
-                initial_elongation=max(box_width, box_height) / max(1, min(box_width, box_height)),
-                initial_brightness=float(gray[mask].mean()) if np.any(mask) else 0.0,
-                initial_area_ratio=float(mask.sum() / mask.size),
-                initial_box=box,
-                tip_extent_ratio=tip_extent_ratio,
-            )
-            if track.active_points is not None:
-                track.trajectories = [
-                    deque([point[0].copy()], maxlen=20) for point in track.active_points
-                ]
-            self.tracks[track.track_id] = track
-            print(f"  track {track.track_id}: fixed benchmark box mode={box_mode}")
+            track = Track(self.next_id, frame_index, mask, last_box=mask_to_box(mask))
+            track.output_box = track.last_box
+            track.active_points = positive[:TRACKING_POINTS].reshape(-1, 1, 2)
+            track.trajectories = [[p[0].tolist()] for p in track.active_points]
+            self.initial_prompts[self.next_id] = build_prompt_arrays(positive, negative)
+            self.tracks[self.next_id] = track
             self.next_id += 1
-            added += 1
-        return added
+        return len(self.tracks)
 
-    def restart_tracker(self, frame_index: int) -> None:
+    def restart_tracker(self, frame_index):
         if not self.tracks:
             self.state = None
             return
-        self.state = self.predictor.init_state(video_path=str(self.temp_dir), is_realtime=True)
+        self.state = self.predictor.init_state(str(self.temp_dir), is_realtime=True)
         self.state["num_frames"] = frame_index + 1
         for track in self.tracks.values():
-            self.predictor.add_new_mask(
-                inference_state=self.state,
-                frame_idx=frame_index,
-                obj_id=track.track_id,
-                mask=track.last_mask,
+            points, labels = self.initial_prompts[track.track_id]
+            self.predictor.add_new_points_or_box(
+                self.state, frame_index, track.track_id, points=points, labels=labels
             )
-
-    def classify_initial(self, frame_index: int, video_name: str) -> None:
-        scored = [(track, motion_score(track)) for track in self.tracks.values()]
-        scored = [(track, score) for track, score in scored if score is not None]
-        score_by_id = {track.track_id: score for track, score in scored}
-        print(
-            f"[{frame_index:06d}] candidate motion scores: "
-            + ", ".join((f"ID{track.track_id}={score:.3f}" for track, score in scored))
-        )
-        if len(scored) >= 2:
-            features = np.asarray([[score] for _, score in scored], dtype=np.float32)
-            labels = KMeans(n_clusters=2, n_init=10, random_state=self.args.seed).fit_predict(
-                features
-            )
-            means = [
-                (
-                    float(features[labels == label].mean())
-                    if np.any(labels == label)
-                    else -float("inf")
-                )
-                for label in (0, 1)
-            ]
-            instrument_label = int(np.argmax(means))
-            self.motion_threshold = float(np.mean([m for m in means if np.isfinite(m)]))
-            for (track, _), label in zip(scored, labels):
-                track.status = "instrument" if label == instrument_label else "background"
-        else:
-            self.motion_threshold = self.args.fallback_motion_threshold
-            for track, score in scored:
-                track.status = "instrument" if score >= self.motion_threshold else "background"
-        settings = MOTION_CLASSIFICATION_SETTINGS_BY_VIDEO.get(video_name)
-        appearance_rejected = []
-        if settings:
-            min_brightness = settings.get("primary_min_brightness")
-            min_elongation = settings.get("primary_min_elongation")
-            max_brightness = settings.get("primary_max_brightness")
-            max_elongation = settings.get("primary_max_elongation")
-            for track in self.tracks.values():
-                if track.status != "instrument":
-                    continue
-                reject_dark_broad = (
-                    min_brightness is not None
-                    and min_elongation is not None
-                    and (track.initial_brightness < float(min_brightness))
-                    and (track.initial_elongation < float(min_elongation))
-                )
-                reject_bright_broad = (
-                    max_brightness is not None
-                    and max_elongation is not None
-                    and (track.initial_brightness > float(max_brightness))
-                    and (track.initial_elongation < float(max_elongation))
-                )
-                if reject_dark_broad or reject_bright_broad:
-                    track.status = "background"
-                    appearance_rejected.append(track.track_id)
-        if appearance_rejected:
-            print(
-                f"[{frame_index:06d}] rejected appearance-incompatible high-motion candidate IDs={appearance_rejected}"
-            )
-        rescued = []
-        if settings and self.motion_threshold is not None:
-            for track in self.tracks.values():
-                if track.status != "background" or track.last_box is None:
-                    continue
-                score = score_by_id.get(track.track_id, 0.0)
-                if (
-                    score >= self.motion_threshold * float(settings["secondary_threshold_ratio"])
-                    and track.initial_elongation >= float(settings["secondary_min_elongation"])
-                    and (track.initial_brightness >= float(settings["secondary_min_brightness"]))
-                    and (
-                        track.initial_area_ratio
-                        >= float(settings.get("secondary_min_area_ratio", 0.0))
-                    )
-                    and (
-                        track.initial_area_ratio
-                        <= float(settings.get("secondary_max_area_ratio", 1.0))
-                    )
-                ):
-                    track.status = "instrument"
-                    rescued.append(track.track_id)
-        if rescued:
-            print(f"[{frame_index:06d}] retained elongated moving candidate IDs={rescued}")
-        duplicate_rejected = []
-        if settings and settings.get("classified_duplicate_box_containment") is not None:
-            containment_threshold = float(settings["classified_duplicate_box_containment"])
-            instruments = [
-                track
-                for track in self.tracks.values()
-                if track.status == "instrument" and track.initial_box is not None
-            ]
-            instruments.sort(
-                key=lambda track: (track.initial_brightness, track.initial_area_ratio), reverse=True
-            )
-            kept = []
-            for track in instruments:
-                if any(
-                    (
-                        box_containment(track.initial_box, other.initial_box)
-                        >= containment_threshold
-                        for other in kept
-                    )
-                ):
-                    track.status = "background"
-                    duplicate_rejected.append(track.track_id)
-                else:
-                    kept.append(track)
-        if duplicate_rejected:
-            print(
-                f"[{frame_index:06d}] merged overlapping instrument candidate IDs={duplicate_rejected}"
-            )
-        adjacent_rejected = []
-        if settings and settings.get("classified_adjacent_merge_gap") is not None:
-            gap_limit = float(settings["classified_adjacent_merge_gap"])
-            motion_ratio_limit = float(settings.get("classified_adjacent_motion_ratio", 0.0))
-            union_elongation_limit = float(
-                settings.get("classified_adjacent_min_union_elongation", 1.0)
-            )
-            instruments = [
-                track
-                for track in self.tracks.values()
-                if track.status == "instrument" and track.initial_box is not None
-            ]
-            adjacent_rescued = []
-            for candidate in self.tracks.values():
-                if candidate.status != "background" or candidate.initial_box is None:
-                    continue
-                candidate_score = score_by_id.get(candidate.track_id, 0.0)
-                if candidate.initial_brightness < float(
-                    settings.get("classified_adjacent_min_brightness", 0.0)
-                ) or candidate.initial_area_ratio > float(
-                    settings.get("classified_adjacent_max_area_ratio", 1.0)
-                ):
-                    continue
-                for confirmed in instruments:
-                    confirmed_score = score_by_id.get(confirmed.track_id, 0.0)
-                    motion_ratio = min(candidate_score, confirmed_score) / max(
-                        1e-06, max(candidate_score, confirmed_score)
-                    )
-                    combined_box = union_box(candidate.initial_box, confirmed.initial_box)
-                    if (
-                        box_gap(candidate.initial_box, confirmed.initial_box) <= gap_limit
-                        and motion_ratio >= motion_ratio_limit
-                        and (box_elongation(combined_box) >= union_elongation_limit)
-                    ):
-                        candidate.status = "instrument"
-                        instruments.append(candidate)
-                        adjacent_rescued.append(candidate.track_id)
-                        break
-            if adjacent_rescued:
-                print(
-                    f"[{frame_index:06d}] recovered adjacent tool fragments IDs={adjacent_rescued}"
-                )
-            consumed: Set[int] = set()
-            for index, first in enumerate(instruments):
-                if first.track_id in consumed:
-                    continue
-                for second in instruments[index + 1 :]:
-                    if second.track_id in consumed:
-                        continue
-                    first_score = score_by_id.get(first.track_id, 0.0)
-                    second_score = score_by_id.get(second.track_id, 0.0)
-                    motion_ratio = min(first_score, second_score) / max(
-                        1e-06, max(first_score, second_score)
-                    )
-                    combined_box = union_box(first.initial_box, second.initial_box)
-                    if (
-                        box_gap(first.initial_box, second.initial_box) > gap_limit
-                        or motion_ratio < motion_ratio_limit
-                        or box_elongation(combined_box) < union_elongation_limit
-                    ):
-                        continue
-                    if settings.get("classified_adjacent_prefer_lateral_distal"):
-                        image_width = first.last_mask.shape[1]
-                        enters_from_left = combined_box[0] <= image_width - 1 - combined_box[2]
-                        first_center_x = (first.initial_box[0] + first.initial_box[2]) / 2.0
-                        second_center_x = (second.initial_box[0] + second.initial_box[2]) / 2.0
-                        if enters_from_left:
-                            keeper, rejected = (
-                                (first, second)
-                                if first_center_x >= second_center_x
-                                else (second, first)
-                            )
-                        else:
-                            keeper, rejected = (
-                                (first, second)
-                                if first_center_x <= second_center_x
-                                else (second, first)
-                            )
-                    else:
-                        keeper, rejected = (
-                            max(
-                                (first, second),
-                                key=lambda track: (
-                                    track.initial_brightness,
-                                    track.initial_area_ratio,
-                                ),
-                            ),
-                            min(
-                                (first, second),
-                                key=lambda track: (
-                                    track.initial_brightness,
-                                    track.initial_area_ratio,
-                                ),
-                            ),
-                        )
-                    distal_anchor = keeper.output_box
-                    merged_mask = np.logical_or(keeper.last_mask, rejected.last_mask)
-                    merged_box = mask_to_box(merged_mask)
-                    if merged_box is not None:
-                        keeper.last_mask = merged_mask
-                        keeper.last_box = merged_box
-                        keeper.output_box = merged_box
-                        keeper.initial_box = union_box(keeper.initial_box, rejected.initial_box)
-                        keeper.initial_area_ratio = float(merged_mask.sum() / merged_mask.size)
-                        keeper.initial_elongation = box_elongation(keeper.initial_box)
-                        box_settings = BENCHMARK_BOX_SETTINGS_BY_VIDEO.get(video_name, {})
-                        force_tip = box_settings.get("force_tip_min_elongation")
-                        keeper.box_mode = (
-                            "tip"
-                            if force_tip is not None
-                            and keeper.initial_elongation >= float(force_tip)
-                            else "full"
-                        )
-                        keeper.output_box, keeper.tip_extent_ratio = benchmark_box_from_mask(
-                            merged_mask,
-                            merged_box,
-                            keeper.box_mode,
-                            previous_box=distal_anchor,
-                            endpoint_quantile=float(box_settings.get("endpoint_quantile", 0.1)),
-                            prefer_distal_each_frame=bool(
-                                box_settings.get("prefer_distal_each_frame", False)
-                            ),
-                        )
-                        keeper.active_points = sample_points(merged_mask, 16, self.rng)
-                        if keeper.active_points is not None:
-                            keeper.trajectories = [
-                                deque([point[0].copy()], maxlen=20)
-                                for point in keeper.active_points
-                            ]
-                    rejected.status = "background"
-                    consumed.add(rejected.track_id)
-                    consumed.add(keeper.track_id)
-                    adjacent_rejected.append((rejected.track_id, keeper.track_id))
-                    if rejected is first:
-                        break
-        if adjacent_rejected:
-            print(
-                f"[{frame_index:06d}] collapsed adjacent same-motion fragments "
-                + ", ".join((f"ID{rejected}->ID{keeper}" for rejected, keeper in adjacent_rejected))
-            )
-        self.initial_classification_done = True
-        instruments = [
-            track.track_id for track in self.tracks.values() if track.status == "instrument"
-        ]
-        print(
-            f"[{frame_index:06d}] initial classification: threshold={self.motion_threshold:.3f}, instrument IDs={instruments}"
-        )
-        self.drop_background_tracks(frame_index)
-
-    def drop_background_tracks(self, frame_index: int) -> None:
-        rejected = [
-            track_id for track_id, track in self.tracks.items() if track.status == "background"
-        ]
-        if not rejected:
-            return
-        for track_id in rejected:
-            del self.tracks[track_id]
-        print(f"[{frame_index:06d}] removed background candidate IDs={rejected}")
-        self.restart_tracker(frame_index)
 
     def propagate(self, frame_index: int) -> Dict[int, np.ndarray]:
         if self.state is None:
@@ -1230,138 +460,68 @@ class STTAMRunner:
             break
         return result
 
-    def update_tracks(
-        self,
-        logits_by_id: Dict[int, np.ndarray],
-        prev_gray: Optional[np.ndarray],
-        gray: np.ndarray,
-        frame_bgr: np.ndarray,
-        frame_index: int,
-    ) -> None:
-        shift = camera_motion(prev_gray, gray) if prev_gray is not None else np.zeros(2)
-        height, width = gray.shape
-        min_pixels = max(20, int(height * width * self.args.min_thin_area_ratio * 0.2))
-        recovered_any = False
-        propagation_settings = MASK_PROPAGATION_SETTINGS_BY_VIDEO.get(
-            self.current_video_name or "", {}
+    def update_tracks(self, logits_by_id, prev_gray, gray, frame_bgr, frame_index):
+        lk = dict(
+            winSize=(31, 31),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
         )
-        exclusive_masks: Dict[int, np.ndarray] = {}
-        if propagation_settings.get("exclusive_logits") and len(logits_by_id) >= 2:
-            object_ids = list(logits_by_id)
-            logit_stack = np.stack([logits_by_id[object_id] for object_id in object_ids], axis=0)
-            winning_object = np.argmax(logit_stack, axis=0)
-            for position, object_id in enumerate(object_ids):
-                exclusive_masks[object_id] = (logit_stack[position] > 0.0) & (
-                    winning_object == position
+        for track in self.tracks.values():
+            if track.status == "background":
+                continue
+            logits = logits_by_id.get(track.track_id)
+            gate = None if logits is None else logits > self.args.anchors["track_mask_threshold"]
+            if prev_gray is not None:
+                track.active_points, track.trajectories, _ = update_anchor_points(
+                    prev_gray, gray, track.active_points, track.trajectories, gate, lk
                 )
-        for track_id, track in list(self.tracks.items()):
-            logits = logits_by_id.get(track_id)
             if logits is None:
-                recovered = (
-                    flow_recovery_mask(track, prev_gray, gray, shift)
-                    if track.status == "instrument"
-                    and track.lost_frames < self.args.flow_recovery_frames
-                    else None
-                )
-                if recovered is not None:
-                    track.last_mask = recovered
-                    track.last_box = mask_to_box(recovered)
-                    track.output_box = track.last_box
-                    track.last_score = max(0.5, track.last_score * 0.98)
-                    track.lost_frames += 1
-                    track.active_points = sample_points(recovered, 16, self.rng)
-                    recovered_any = True
-                    continue
                 track.lost_frames += 1
                 continue
-            mask = largest_component(exclusive_masks.get(track_id, logits > 0.0))
-            box = mask_to_box(mask, min_pixels=min_pixels)
-            score = confidence_from_logits(logits, mask)
-            if box is None or score < 0.52:
-                recovered = (
-                    flow_recovery_mask(track, prev_gray, gray, shift)
-                    if track.status == "instrument"
-                    and track.lost_frames < self.args.flow_recovery_frames
-                    else None
+            mask = logits > 0.0
+            track.last_mask = mask
+            track.last_box = track.output_box = mask_to_box(mask)
+            track.last_score = confidence_from_logits(logits, mask)
+            track.lost_frames = 0 if track.last_box is not None else track.lost_frames + 1
+
+            if frame_index > 0 and track.active_points is not None and len(track.active_points):
+                points, labels = build_prompt_arrays(track.active_points, None)
+                self.predictor.add_new_points_or_box(
+                    self.state, frame_index, track.track_id,
+                    points=points, labels=labels, clear_old_points=True,
                 )
-                if recovered is not None:
-                    track.last_mask = recovered
-                    track.last_box = mask_to_box(recovered)
-                    track.output_box = track.last_box
-                    track.last_score = max(0.5, track.last_score * 0.98)
-                    track.lost_frames += 1
-                    track.active_points = sample_points(recovered, 16, self.rng)
-                    recovered_any = True
-                    continue
-                track.lost_frames += 1
-            else:
-                track.last_mask = mask
-                track.last_box = box
-                track.output_box, track.tip_extent_ratio = benchmark_box_from_mask(
-                    mask,
-                    box,
-                    track.box_mode,
-                    previous_box=track.output_box,
-                    endpoint_quantile=float(
-                        BENCHMARK_BOX_SETTINGS_BY_VIDEO.get(self.current_video_name or "", {}).get(
-                            "endpoint_quantile", 0.1
-                        )
-                    ),
-                    prefer_distal_each_frame=bool(
-                        BENCHMARK_BOX_SETTINGS_BY_VIDEO.get(self.current_video_name or "", {}).get(
-                            "prefer_distal_each_frame", False
-                        )
-                    ),
-                    frame_bgr=frame_bgr,
-                    appearance_settings=BENCHMARK_BOX_SETTINGS_BY_VIDEO.get(
-                        self.current_video_name or "", {}
-                    ),
-                    previous_extent_ratio=track.tip_extent_ratio,
-                )
-                if track.box_mode == "full":
-                    box_settings = BENCHMARK_BOX_SETTINGS_BY_VIDEO.get(
-                        self.current_video_name or "", {}
-                    )
-                    track.output_box = preserve_full_box_short_side(
-                        track.output_box,
-                        track.initial_box,
-                        float(box_settings.get("full_min_short_side_ratio", 0.0)),
-                        mask.shape,
-                    )
-                track.last_score = score
-                track.lost_frames = 0
-                track.age += 1
-                if prev_gray is not None:
-                    update_motion(track, prev_gray, gray, mask, shift, self.rng)
-        if recovered_any:
-            self.restart_tracker(frame_index)
-        max_lost_frames = int(
-            MAX_LOST_FRAMES_BY_VIDEO.get(self.current_video_name or "", self.args.max_lost_frames)
+
+    def classify_initial(self, frame_index, video_name):
+        tracks = list(self.tracks.values())
+        labels, details = classify_instrument_candidates(
+            [t.trajectories for t in tracks], len(tracks)
         )
-        expired = [
-            track_id
-            for track_id, track in self.tracks.items()
-            if track.lost_frames > max_lost_frames
-        ]
-        for track_id in expired:
-            del self.tracks[track_id]
-            print(f"track {track_id} expired after {max_lost_frames} lost frames")
+        for track, label in zip(tracks, labels):
+            track.status = "instrument" if label == 0 else "background"
+        self.initial_classification_done = True
+        print("Motion classification:", details)
 
     def assign_yolo_boxes(self, frame_index: int) -> None:
-        """Assign shared detector boxes to stTAM identities one-to-one."""
-        if self.yolo_detections is None or frame_index >= len(self.yolo_detections):
+
+        if self.args.benchmark_box_source != "yolo11":
             return
+        if self.yolo_detections is None or frame_index >= len(self.yolo_detections):
+            for track in self.tracks.values():
+                track.output_box = None
+            raise ValueError(f"Missing shared detections for frame {frame_index}")
         active = [
             track
             for track in self.tracks.values()
-            if not track.lost_frames and track.output_box is not None
+            if track.status != "background" and not track.lost_frames and track.last_box is not None
         ]
+        for track in self.tracks.values():
+            track.output_box = None
         detections = self.yolo_detections[frame_index]
         if not active or not len(detections):
             return
         track_boxes = np.asarray(
             [
-                [t.output_box[0], t.output_box[1], t.output_box[2] + 1, t.output_box[3] + 1]
+                [t.last_box[0], t.last_box[1], t.last_box[2] + 1, t.last_box[3] + 1]
                 for t in active
             ],
             dtype=np.float32,
@@ -1380,17 +540,20 @@ class STTAMRunner:
         similarities = np.divide(
             intersection, union, out=np.zeros_like(intersection), where=union > 0
         )
-        rows, columns = linear_sum_assignment(1.0 - similarities)
+        allowed = similarities >= self.args.box_association_iou
+        cost = np.where(allowed, 1.0 - similarities, len(active) + len(detections) + 1.0)
+        rows, columns = linear_sum_assignment(cost)
         for row, column in zip(rows, columns):
             if similarities[row, column] < self.args.box_association_iou:
                 continue
             box = det_boxes[column]
             active[row].output_box = (
-                int(round(box[0])),
-                int(round(box[1])),
-                int(round(box[2] - 1)),
-                int(round(box[3] - 1)),
+                float(box[0]),
+                float(box[1]),
+                float(box[2]) - 1.0,
+                float(box[3]) - 1.0,
             )
+            active[row].last_score = float(detections[column, 4])
 
     def prune_state(self, frame_index: int, keep_frames: int = 32) -> None:
         if self.state is None:
@@ -1403,6 +566,15 @@ class STTAMRunner:
         for index in list(self.state["frames_already_tracked"]):
             if index < cutoff:
                 self.state["frames_already_tracked"].pop(index, None)
+        old_prompts = {
+            index for index in self.state["consolidated_frame_inds"]["non_cond_frame_outputs"]
+            if index < cutoff
+        }
+        self.state["consolidated_frame_inds"]["non_cond_frame_outputs"].difference_update(old_prompts)
+        for key in ("point_inputs_per_obj", "mask_inputs_per_obj"):
+            for inputs in self.state[key].values():
+                for index in old_prompts:
+                    inputs.pop(index, None)
 
     def mot_lines(self, frame_index: int) -> List[str]:
         lines = []
@@ -1412,7 +584,7 @@ class STTAMRunner:
             x1, y1, x2, y2 = track.output_box
             width, height = (x2 - x1 + 1, y2 - y1 + 1)
             lines.append(
-                f"{frame_index},{track.track_id},{x1:.2f},{y1:.2f},{width:.2f},{height:.2f},{track.last_score:.6f},-1,-1,-1\n"
+                f"{frame_index},{track.track_id},{x1:.6f},{y1:.6f},{width:.6f},{height:.6f},{track.last_score:.6f},-1,-1,-1\n"
             )
         return lines
 
@@ -1425,14 +597,14 @@ class STTAMRunner:
                 continue
             if track.status == "background":
                 continue
-            x1, y1, x2, y2 = track.output_box
+            x1, y1, x2, y2 = (int(round(value)) for value in track.output_box)
             if track.status == "instrument":
                 instrument_ids.append(track.track_id)
                 color = palette[(track.track_id - 1) % len(palette)]
-                label = f"ID {track.track_id} [{track.box_mode}]"
+                label = f"ID {track.track_id}"
             else:
                 color = (180, 180, 180)
-                label = f"candidate {track.track_id} [{track.box_mode}]"
+                label = f"candidate {track.track_id}"
             mask = np.asarray(track.last_mask, dtype=bool)
             if mask.shape == canvas.shape[:2] and np.any(mask):
                 pixels = canvas[mask].astype(np.float32)
@@ -1469,81 +641,8 @@ class STTAMRunner:
         return canvas
 
 
-class EndoVisRunner(STTAMRunner):
-    """EndoVis automatic candidates and two-dimensional motion features."""
-
-    def discover(self, frame_bgr, video_name):
-        settings = self.args.endovis
-        return [
-            m["segmentation"].astype(bool)
-            for m in self.mask_generator.generate(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-            if settings["candidate_min_area"] < m["area"] < settings["candidate_max_area"]
-        ]
-
-    def add_candidates(self, masks, frame_index, frame_bgr):
-        self.initial_prompts = {}
-        for mask in masks:
-            positive, negative = sample_prompt_points(
-                mask, self.args.endovis["initial_positive_points"], 5
-            )
-            if positive is None:
-                continue
-            track = Track(self.next_id, frame_index, mask, last_box=mask_to_box(mask))
-            track.output_box = track.last_box
-            track.active_points = positive[:TRACKING_POINTS].reshape(-1, 1, 2)
-            track.trajectories = [[p[0].tolist()] for p in track.active_points]
-            self.initial_prompts[self.next_id] = build_prompt_arrays(positive, negative)
-            self.tracks[self.next_id] = track
-            self.next_id += 1
-        return len(self.tracks)
-
-    def restart_tracker(self, frame_index):
-        if not self.tracks:
-            self.state = None
-            return
-        self.state = self.predictor.init_state(str(self.temp_dir), is_realtime=True)
-        self.state["num_frames"] = frame_index + 1
-        for track in self.tracks.values():
-            points, labels = self.initial_prompts[track.track_id]
-            self.predictor.add_new_points_or_box(
-                self.state, frame_index, track.track_id, points=points, labels=labels
-            )
-
-    def update_tracks(self, logits_by_id, prev_gray, gray, frame_bgr, frame_index):
-        lk = dict(
-            winSize=(31, 31),
-            maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
-        )
-        for track in self.tracks.values():
-            logits = logits_by_id.get(track.track_id)
-            gate = None if logits is None else logits > self.args.endovis["track_mask_threshold"]
-            if prev_gray is not None:
-                track.active_points, track.trajectories, _ = update_anchor_points(
-                    prev_gray, gray, track.active_points, track.trajectories, gate, lk
-                )
-            if logits is None:
-                track.lost_frames += 1
-                continue
-            mask = logits > 0.0
-            track.last_mask = mask
-            track.last_box = track.output_box = mask_to_box(mask)
-            track.last_score = confidence_from_logits(logits, mask)
-            track.lost_frames = 0 if track.last_box is not None else track.lost_frames + 1
-
-    def classify_initial(self, frame_index, video_name):
-        tracks = list(self.tracks.values())
-        labels, details = classify_instrument_candidates(
-            [t.trajectories for t in tracks], len(tracks)
-        )
-        for track, label in zip(tracks, labels):
-            track.status = "instrument" if label == 0 else "background"
-        self.initial_classification_done = True
-        print("Motion classification:", details)
-
-
 def load_detections(path, frame_count, video_path):
-    """Load frame-aligned shared boxes; no detector training happens here."""
+
     if path is None or not path.is_file():
         raise FileNotFoundError(
             "Shared mode needs --detection-cache with one detection list per input frame. Use --box-source mask for the detector-free demo."
@@ -1565,8 +664,8 @@ def load_detections(path, frame_count, video_path):
         ):
             raise ValueError(f"Invalid box coordinates or confidence at frame {index}.")
         parsed.append(det)
-    # Original caches may name a moved source file. Frame alignment is the
-    # caller's responsibility; never silently shift an absolute-frame cache.
+
+
     return parsed
 
 
@@ -1603,7 +702,7 @@ def main(argv=None):
         parser.error("CUDA is unavailable in this PyTorch installation")
     global RANDOM_SEED, HISTORY_LENGTH, TRACKING_POINTS, MIN_VALID_POINTS
     RANDOM_SEED = int(config["seed"])
-    settings = config.get("endovis", {})
+    settings = config["anchors"]
     HISTORY_LENGTH = int(settings.get("history_length", 20))
     TRACKING_POINTS = int(settings.get("tracking_points", 10))
     MIN_VALID_POINTS = int(settings.get("min_valid_points", 5))
@@ -1611,17 +710,9 @@ def main(argv=None):
     torch.manual_seed(RANDOM_SEED)
     args = argparse.Namespace(**config["tracker"])
     args.seed = RANDOM_SEED
-    args.endovis = settings
+    args.anchors = settings
     args.benchmark_box_source = cli.box_source or config["box_source"]
     args.mask_alpha = 0.35
-    for name, mapping in [
-        ("discovery", DISCOVERY_FILTER_SETTINGS_BY_VIDEO),
-        ("motion", MOTION_CLASSIFICATION_SETTINGS_BY_VIDEO),
-        ("boxes", BENCHMARK_BOX_SETTINGS_BY_VIDEO),
-        ("propagation", MASK_PROPAGATION_SETTINGS_BY_VIDEO),
-    ]:
-        mapping.clear()
-        mapping["demo"] = config.get(name, {})
     capture = None
     if cli.input.is_dir():
         paths = sorted(
@@ -1666,7 +757,7 @@ def main(argv=None):
     if args.benchmark_box_source == "yolo11":
         detections = load_detections(cli.detection_cache, limit, cli.input)
     print(f"Loading frozen EdgeTAM on {device}; box source: {args.benchmark_box_source}")
-    # Reuse one frozen network for automatic masks and video propagation.
+
     predictor = build_sam2_video_predictor(
         config["model_cfg"],
         str(cli.checkpoint),
@@ -1674,10 +765,10 @@ def main(argv=None):
         hydra_overrides_extra=["++model.fill_hole_area=0"],
     )
     predictor.__class__ = StreamingPredictor
+    if predictor.spatial_perceiver is not None:
+        predictor.spatial_perceiver.__class__ = BatchedPerceiverResampler
     mask_generator = SAM2AutomaticMaskGenerator(model=predictor, **config["mask_generator"])
-    cls = EndoVisRunner if config["protocol"] == "endovis2017" else STTAMRunner
-    runner = cls(args, predictor, mask_generator)
-    runner.current_video_name = "demo"
+    runner = STTAMRunner(args, predictor, mask_generator)
     runner.yolo_detections = detections
     writer = None
     processed = 0
@@ -1686,7 +777,7 @@ def main(argv=None):
         with tempfile.TemporaryDirectory(prefix="sttam_demo_") as temp, (
             cli.output / "tracks.txt"
         ).open("w", encoding="utf-8") as output, torch.inference_mode(), torch.autocast(
-            device_type=device, dtype=torch.float16, enabled=device == "cuda"
+            device_type=device, dtype=torch.bfloat16, enabled=device == "cuda"
         ):
             runner.temp_dir = Path(temp)
             for index, frame in enumerate(frames):
@@ -1721,7 +812,7 @@ def main(argv=None):
                 runner.assign_yolo_boxes(index)
                 if not runner.initial_classification_done and index >= observation:
                     runner.classify_initial(index, "demo")
-                if runner.initial_classification_done:
+                if runner.initial_classification_done and index > observation:
                     output.writelines(runner.mot_lines(index + 1))
                 canvas = runner.render_frame(frame, index)
                 writer.write(canvas)

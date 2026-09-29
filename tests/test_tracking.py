@@ -1,5 +1,3 @@
-"""Run the bundled video demo (this is an executable smoke test, not pytest)."""
-
 from pathlib import Path
 import argparse
 import subprocess
@@ -8,7 +6,7 @@ import sys
 
 def main():
     root = Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description="Run the VID01 video demo")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to edgetam.pt")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--max-frames", type=int, default=150, help="Use 0 for the full clip")
